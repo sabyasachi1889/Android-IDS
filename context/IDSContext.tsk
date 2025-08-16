@@ -1,0 +1,196 @@
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { Platform } from 'react-native';
+import * as Application from 'expo-application';
+import * as Device from 'expo-device';
+import * as Network from 'expo-network';
+import { SETTINGS_KEY, LOGS_KEY, safeGetItem, safeSetItem } from '../lib/idsStorage';
+import type { CheckResult, IDSSettings, LogEntry, RiskLevel, ScanResult } from '../types/ids';
+import { defaultSettings } from '../types/ids';
+import { uid } from '../lib/id';
+
+const clamp = (n: number, min = 0, max = 100) => Math.max(min, Math.min(max, n));
+
+function severityWeight(s: RiskLevel) {
+  switch (s) {
+    case 'high':
+      return 40;
+    case 'medium':
+      return 20;
+    default:
+      return 8;
+  }
+}
+
+async function detectRoot(): Promise<CheckResult> {
+  // Heuristic-based due to Expo limitations
+  const indicators: string[] = [];
+  const isEmulator = !Device.isDevice;
+  if (isEmulator) indicators.push('running on emulator/simulator');
+  const hasAndroidId = Application.androidId != null;
+  if (Platform.OS === 'android' && !hasAndroidId) indicators.push('missing androidId');
+  const passed = indicators.length === 0;
+  return {
+    id: 'root',
+    passed,
+    severity: 'high',
+    message: passed ? 'No root indicators found.' : `Potential compromise indicators: ${indicators.join(', ')}`,
+    meta: { indicators },
+  };
+}
+
+async function detectEmulator(): Promise<CheckResult> {
+  const emulator = !Device.isDevice;
+  return {
+    id: 'emulator',
+    passed: !emulator,
+    severity: 'medium',
+    message: emulator ? 'Running on emulator' : 'Physical device detected',
+    meta: { isDevice: Device.isDevice, brand: Device.brand, model: Device.modelName },
+  };
+}
+
+async function detectDevMode(): Promise<CheckResult> {
+  const devMode: boolean = typeof __DEV__ !== 'undefined' ? __DEV__ : false;
+  return {
+    id: 'devMode',
+    passed: !devMode,
+    severity: 'medium',
+    message: devMode ? 'JS development mode enabled' : 'Production JS bundle',
+  };
+}
+
+async function detectScreenLock(): Promise<CheckResult> {
+  return {
+    id: 'screenLock',
+    passed: true,
+    severity: 'low',
+    message: 'Ensure device screen lock (PIN/biometric) is enabled.',
+  };
+}
+
+async function detectInternet(): Promise<CheckResult> {
+  const state = await Network.getNetworkStateAsync();
+  const internet = state.isConnected && state.isInternetReachable !== false;
+  return {
+    id: 'internet',
+    passed: internet === true,
+    severity: 'low',
+    message: internet ? 'Internet reachable' : 'No internet connectivity',
+    meta: state as any,
+  };
+}
+
+async function detectNetworkType(): Promise<CheckResult> {
+  const state = await Network.getNetworkStateAsync();
+  const type = state.type;
+  const risky = type === Network.NetworkStateType.UNKNOWN || type === Network.NetworkStateType.OTHER;
+  return {
+    id: 'network',
+    passed: !risky,
+    severity: risky ? 'medium' : 'low',
+    message: `Network type: ${type}`,
+  };
+}
+
+function computeScore(results: CheckResult[]): { score: number; highest: RiskLevel } {
+  let score = 0;
+  let highest: RiskLevel = 'low';
+  for (const r of results) {
+    if (!r.passed) {
+      score += severityWeight(r.severity);
+      if (r.severity === 'high') highest = 'high';
+      else if (r.severity === 'medium' && highest !== 'high') highest = 'medium';
+    }
+  }
+  return { score: clamp(score), highest };
+}
+
+const IDSContext = createContext<{
+  settings: IDSSettings;
+  logs: LogEntry[];
+  runScan: () => Promise<ScanResult>;
+  clearLogs: () => void;
+  updateSetting: <K extends keyof IDSSettings>(key: K, value: IDSSettings[K]) => void;
+  toggleCheck: (id: keyof IDSSettings['enabledChecks']) => void;
+} | null>(null);
+
+export function IDSProvider({ children }: { children: React.ReactNode }) {
+  const [settings, setSettings] = useState<IDSSettings>(defaultSettings);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const isRestored = useRef(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const s = await safeGetItem(SETTINGS_KEY);
+        if (s) setSettings(JSON.parse(s));
+      } catch {}
+      try {
+        const l = await safeGetItem(LOGS_KEY);
+        if (l) setLogs(JSON.parse(l));
+      } catch {}
+      isRestored.current = true;
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!isRestored.current) return;
+    safeSetItem(SETTINGS_KEY, JSON.stringify(settings));
+  }, [settings]);
+
+  useEffect(() => {
+    if (!isRestored.current) return;
+    safeSetItem(LOGS_KEY, JSON.stringify(logs));
+  }, [logs]);
+
+  const runScan = useCallback(async (): Promise<ScanResult> => {
+    const checks: Array<Promise<CheckResult>> = [];
+    if (settings.enabledChecks.root) checks.push(detectRoot());
+    if (settings.enabledChecks.emulator) checks.push(detectEmulator());
+    if (settings.enabledChecks.devMode) checks.push(detectDevMode());
+    if (settings.enabledChecks.screenLock) checks.push(detectScreenLock());
+    if (settings.enabledChecks.internet) checks.push(detectInternet());
+    if (settings.enabledChecks.network) checks.push(detectNetworkType());
+
+    const results = await Promise.all(checks);
+    const { score, highest } = computeScore(results);
+
+    const newLogs: LogEntry[] = results
+      .filter((r) => !r.passed)
+      .map((r) => ({ id: uid(), time: Date.now(), level: r.severity, check: r.id, message: r.message, meta: r.meta ?? null }));
+
+    if (newLogs.length) setLogs((prev) => [...newLogs, ...prev].slice(0, 200));
+
+    return { timestamp: Date.now(), results, riskScore: score, highestSeverity: highest };
+  }, [settings]);
+
+  const clearLogs = useCallback(() => setLogs([]), []);
+
+  const updateSetting = useCallback(
+    <K extends keyof IDSSettings>(key: K, value: IDSSettings[K]) => {
+      setSettings((s) => ({ ...s, [key]: value }));
+    },
+    []
+  );
+
+  const toggleCheck = useCallback((id: keyof IDSSettings['enabledChecks']) => {
+    setSettings((s) => ({ ...s, enabledChecks: { ...s.enabledChecks, [id]: !s.enabledChecks[id] } }));
+  }, []);
+
+  const value = {
+    settings,
+    logs,
+    runScan,
+    clearLogs,
+    updateSetting,
+    toggleCheck,
+  } as const;
+
+  return <IDSContext.Provider value={value}>{children}</IDSContext.Provider>;
+}
+
+export function useIDS() {
+  const ctx = useContext(IDSContext);
+  if (!ctx) throw new Error('useIDS must be used within IDSProvider');
+  return ctx;
+}
